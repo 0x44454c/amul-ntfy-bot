@@ -34,7 +34,7 @@ Or manually:
 ```bash
 mkdir -p ~/ntfy-bot
 cp ntfy_bot ~/ntfy-bot/
-echo "BOT_TOKEN=your_token" > ~/ntfy-bot/.env
+cp .env.example ~/ntfy-bot/.env  # or your own .env with BOT_TOKEN
 mkdir -p ~/.config/systemd/user
 cp deploy/ntfy-bot.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now ntfy-bot

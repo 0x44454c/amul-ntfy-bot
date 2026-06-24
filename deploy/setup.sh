@@ -14,10 +14,12 @@ CGO_ENABLED=1 go build -tags prod -ldflags="-s -w" -o "$INSTALL_DIR/ntfy_bot" .
 
 # Create .env if missing
 if [ ! -f "$INSTALL_DIR/.env" ]; then
-    echo "Creating $INSTALL_DIR/.env — edit with your BOT_TOKEN"
-    cat > "$INSTALL_DIR/.env" <<'EOF'
-BOT_TOKEN=your_bot_token_here
-EOF
+    if [ -f "$(dirname "$0")/../.env" ]; then
+        cp "$(dirname "$0")/../.env" "$INSTALL_DIR/"
+    else
+        cp "$(dirname "$0")/../.env.example" "$INSTALL_DIR/.env"
+        echo "Created $INSTALL_DIR/.env from .env.example — edit with your BOT_TOKEN"
+    fi
 fi
 
 # Install user service
