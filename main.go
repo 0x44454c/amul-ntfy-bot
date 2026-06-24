@@ -793,7 +793,8 @@ func (app *App) handleTracked(ctx context.Context, b *bot.Bot, update *models.Up
 	}
 
 	var blocks []block
-	for i, p := range products {
+	idx := 0
+	for _, p := range products {
 		if _, ok := trackedMap[p.SKU]; !ok {
 			continue
 		}
@@ -804,8 +805,9 @@ func (app *App) handleTracked(ctx context.Context, b *bot.Bot, update *models.Up
 		}
 		isTrk := app.isTracked(userID, p.SKU)
 		isF := app.isFav(userID, p.SKU)
-		text := formatProductBlock(p, i, app.getLastInStockAt(p.SKU, user.Substore), remainingArgs...) + "\n" + productLinks(app.botUser, p.SKU, isTrk, isF)
+		text := formatProductBlock(p, idx, app.getLastInStockAt(p.SKU, user.Substore), remainingArgs...) + "\n" + productLinks(app.botUser, p.SKU, isTrk, isF)
 		blocks = append(blocks, block{text: text, sku: p.SKU})
+		idx++
 	}
 
 	if len(blocks) == 0 {
@@ -892,14 +894,16 @@ func (app *App) handleFavourites(ctx context.Context, b *bot.Bot, update *models
 	}
 
 	var blocks []block
-	for i, p := range products {
+	idx := 0
+	for _, p := range products {
 		if !favMap[p.SKU] {
 			continue
 		}
 		isTrk := app.isTracked(userID, p.SKU)
 		isF := app.isFav(userID, p.SKU)
-		text := formatProductBlock(p, i, app.getLastInStockAt(p.SKU, user.Substore)) + "\n" + productLinks(app.botUser, p.SKU, isTrk, isF)
+		text := formatProductBlock(p, idx, app.getLastInStockAt(p.SKU, user.Substore)) + "\n" + productLinks(app.botUser, p.SKU, isTrk, isF)
 		blocks = append(blocks, block{text: text, sku: p.SKU})
+		idx++
 	}
 
 	if len(blocks) == 0 {
