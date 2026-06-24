@@ -5,3 +5,5 @@ amul-notify/
 *.db-wal
 ntfy_bot
 .DS_Store
+test.json
+*.txt

@@ -5,14 +5,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/opt/ntfy-bot
-ExecStart=/opt/ntfy-bot/ntfy_bot
-EnvironmentFile=/opt/ntfy-bot/.env
+WorkingDirectory=%h/ntfy-bot
+ExecStart=%h/ntfy-bot/ntfy_bot
+EnvironmentFile=%h/ntfy-bot/.env
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
