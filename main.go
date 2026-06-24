@@ -198,6 +198,12 @@ type AmulSession struct {
 	mu       sync.Mutex
 }
 
+type pendingChange struct {
+	pincode  string
+	substore string
+	chatID   int64
+}
+
 type App struct {
 	db       *gorm.DB
 	b        *bot.Bot
@@ -207,8 +213,10 @@ type App struct {
 	cacheMu  sync.RWMutex
 	botUser  string
 
-	awaitingInput   map[int64]string
-	awaitingInputMu sync.Mutex
+	awaitingInput    map[int64]string
+	awaitingInputMu  sync.Mutex
+	pendingPincode   map[int64]*pendingChange
+	pendingPincodeMu sync.Mutex
 }
 
 func loadEnvToken(key string) string {
@@ -286,7 +294,8 @@ func main() {
 		b:             b,
 		sessions:      make(map[string]*AmulSession),
 		cache:         make(map[string][]Product),
-		awaitingInput: make(map[int64]string),
+		awaitingInput:    make(map[int64]string),
+		pendingPincode:    make(map[int64]*pendingChange),
 	}
 
 	me, err := b.GetMe(context.Background())
@@ -320,6 +329,8 @@ func (app *App) registerHandlers() {
 
 	app.b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "fav:", bot.MatchTypePrefix, app.handleFavCallback)
 	app.b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "trk:", bot.MatchTypePrefix, app.handleTrkCallback)
+	app.b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "pincode:confirm:", bot.MatchTypePrefix, app.handlePincodeConfirmCallback)
+	app.b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "pincode:cancel:", bot.MatchTypePrefix, app.handlePincodeCancelCallback)
 	app.b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "view_tracked", bot.MatchTypeExact, app.handleViewTracked)
 	app.b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "view_favs", bot.MatchTypeExact, app.handleViewFavs)
 	app.b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "toggle_style", bot.MatchTypeExact, app.handleToggleStyle)
@@ -505,6 +516,7 @@ func (app *App) handleSetPincode(ctx context.Context, b *bot.Bot, update *models
 	payload := strings.TrimSpace(update.Message.Text)
 	payload = strings.TrimPrefix(payload, "/setpincode")
 	payload = strings.TrimSpace(payload)
+
 	if payload == "" {
 		app.send(ctx, update.Message.Chat.ID, "Usage: /setpincode <code>&lt;pincode&gt;</code>\n\nExample: /setpincode 110001")
 		return
@@ -518,6 +530,17 @@ func (app *App) handleSetPincode(ctx context.Context, b *bot.Bot, update *models
 
 	app.ensureUser(update.Message.From.ID)
 
+	user, _ := app.getUser(update.Message.From.ID)
+	isNewPincode := user == nil || user.Pincode != payload
+	if !isNewPincode {
+		app.send(ctx, update.Message.Chat.ID, fmt.Sprintf("Pincode <code>%s</code> is already set for your account.", payload))
+		return
+	}
+
+	tracked, _ := app.getTracked(update.Message.From.ID)
+	favs, _ := app.getFavs(update.Message.From.ID)
+	hasItems := len(tracked) > 0 || len(favs) > 0
+
 	substore, err := app.searchPincode(payload)
 	if err != nil {
 		log.Printf("Pincode search error for %s: %v", payload, err)
@@ -525,18 +548,99 @@ func (app *App) handleSetPincode(ctx context.Context, b *bot.Bot, update *models
 		return
 	}
 
-	if err := app.updatePincode(update.Message.From.ID, payload, substore); err != nil {
-		log.Printf("Error updating pincode: %v", err)
-		app.send(ctx, update.Message.Chat.ID, "An error occurred. Please try again.")
+	if hasItems {
+		app.pendingPincodeMu.Lock()
+		app.pendingPincode[update.Message.From.ID] = &pendingChange{
+			pincode:  payload,
+			substore: substore,
+			chatID:   update.Message.Chat.ID,
+		}
+		app.pendingPincodeMu.Unlock()
+
+		kb := &models.InlineKeyboardMarkup{
+			InlineKeyboard: [][]models.InlineKeyboardButton{
+				{
+					{Text: "✅ Confirm", CallbackData: fmt.Sprintf("pincode:confirm:%d", update.Message.From.ID)},
+					{Text: "❌ Cancel", CallbackData: fmt.Sprintf("pincode:cancel:%d", update.Message.From.ID)},
+				},
+			},
+		}
+		app.send(ctx, update.Message.Chat.ID,
+			"⚠️ Changing your pincode will clear your tracked products and favourites.\n\nProceed?", kb)
 		return
 	}
+
+	app.applyPincodeChange(ctx, update.Message.From.ID, update.Message.Chat.ID, payload, substore, true)
+}
+
+func (app *App) applyPincodeChange(ctx context.Context, userID, chatID int64, pincode, substore string, sendMsg bool) {
+	if err := app.updatePincode(userID, pincode, substore); err != nil {
+		log.Printf("Error updating pincode: %v", err)
+		app.send(ctx, chatID, "An error occurred. Please try again.")
+		return
+	}
+
+	app.db.Where("user_id = ?", userID).Delete(&TrackedProduct{})
+	app.db.Where("user_id = ?", userID).Delete(&Favourite{})
 
 	app.cacheMu.Lock()
 	delete(app.cache, substore)
 	app.cacheMu.Unlock()
 
-	app.send(ctx, update.Message.Chat.ID,
-		fmt.Sprintf("Pincode set to <code>%s</code>\nSubstore: <b>%s</b>\n\nUse /products to browse available products.", payload, substore))
+	if sendMsg {
+		app.send(ctx, chatID,
+			fmt.Sprintf("Pincode set to <code>%s</code>\nSubstore: <b>%s</b>\n\nTracked products and favourites have been cleared for the new location.\n\nUse /products to browse available products.", pincode, substore))
+	}
+}
+
+func (app *App) handlePincodeConfirmCallback(ctx context.Context, b *bot.Bot, update *models.Update) {
+	data := strings.TrimPrefix(update.CallbackQuery.Data, "pincode:confirm:")
+	userID, _ := strconv.ParseInt(data, 10, 64)
+
+	app.pendingPincodeMu.Lock()
+	pending := app.pendingPincode[userID]
+	delete(app.pendingPincode, userID)
+	app.pendingPincodeMu.Unlock()
+
+	if pending == nil {
+		b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
+			CallbackQueryID: update.CallbackQuery.ID,
+			Text:            "No pending pincode change. Try again.",
+			ShowAlert:       true,
+		})
+		return
+	}
+
+	b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
+		CallbackQueryID: update.CallbackQuery.ID,
+	})
+	app.applyPincodeChange(ctx, userID, pending.chatID, pending.pincode, pending.substore, false)
+	b.EditMessageText(ctx, &bot.EditMessageTextParams{
+		ChatID:    pending.chatID,
+		MessageID: update.CallbackQuery.Message.Message.ID,
+		Text:      fmt.Sprintf("✅ Pincode changed to <code>%s</code>\n\nTracked products and favourites have been cleared.", pending.pincode),
+		ParseMode: models.ParseModeHTML,
+	})
+}
+
+func (app *App) handlePincodeCancelCallback(ctx context.Context, b *bot.Bot, update *models.Update) {
+	data := strings.TrimPrefix(update.CallbackQuery.Data, "pincode:cancel:")
+	userID, _ := strconv.ParseInt(data, 10, 64)
+
+	app.pendingPincodeMu.Lock()
+	delete(app.pendingPincode, userID)
+	app.pendingPincodeMu.Unlock()
+
+	b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
+		CallbackQueryID: update.CallbackQuery.ID,
+	})
+
+	b.EditMessageText(ctx, &bot.EditMessageTextParams{
+		ChatID:      update.CallbackQuery.Message.Message.Chat.ID,
+		MessageID:   update.CallbackQuery.Message.Message.ID,
+		Text:        "❌ Pincode change cancelled.",
+		ParseMode:   models.ParseModeHTML,
+	})
 }
 
 func (app *App) handlePincode(ctx context.Context, b *bot.Bot, update *models.Update) {
