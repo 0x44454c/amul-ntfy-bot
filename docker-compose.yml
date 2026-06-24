@@ -1,0 +1,50 @@
+services:
+  redis:
+    image: docker.io/library/redis:8-alpine
+    container_name: amul-redis
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ${HOME}/data/redis:/data
+    command: redis-server --appendonly yes
+
+  postgres:
+    image: ghcr.io/ferretdb/postgres-documentdb:16
+    container_name: amul-postgres
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ${HOME}/data/postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: amul
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: amul
+
+  ferretdb:
+    image: ghcr.io/ferretdb/ferretdb:2
+    container_name: amul-ferretdb
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - postgres
+    environment:
+      FERRETDB_POSTGRESQL_URL: postgres://amul:amul@localhost:5432/postgres
+      FERRETDB_AUTH: false
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: amul-app
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - redis
+      - ferretdb
+    env_file:
+      - .env.prod
+    environment:
+      REDIS_HOST: localhost
+      MONGO_URI: mongodb://localhost:27017/postgres
+
+
