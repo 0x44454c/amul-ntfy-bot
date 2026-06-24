@@ -1,10 +1,19 @@
 #!/bin/bash
 set -e
 
-echo "=== ntfy-bot user service deployment ==="
-
 INSTALL_DIR="$HOME/ntfy-bot"
 SERVICE_NAME=ntfy-bot
+
+if [ "$1" = "--redeploy" ] || [ "$1" = "-r" ]; then
+    echo "=== Redeploy: build & restart ==="
+    CGO_ENABLED=1 go build -tags prod -ldflags="-s -w" -o "$INSTALL_DIR/ntfy_bot" .
+    systemctl --user restart $SERVICE_NAME
+    echo "=== Done ==="
+    systemctl --user status $SERVICE_NAME --no-pager
+    exit 0
+fi
+
+echo "=== ntfy-bot user service deployment ==="
 
 # Create directories
 mkdir -p "$INSTALL_DIR"

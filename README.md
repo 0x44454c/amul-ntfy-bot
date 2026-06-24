@@ -25,8 +25,16 @@ GOOS=linux GOARCH=amd64 go build -tags prod -ldflags="-s -w" -o ntfy_bot .
 
 ## Deploy (user service)
 
+**First time:**
+
 ```bash
 ./deploy/setup.sh
+```
+
+**Redeploy** (build & restart only):
+
+```bash
+./deploy/setup.sh --redeploy
 ```
 
 Or manually:
