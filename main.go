@@ -1803,8 +1803,10 @@ func (app *App) checkStock(ctx context.Context) {
 					app.db.Delete(&TrackedProduct{}, tp.ID)
 				}
 
-				text := fmt.Sprintf("✅ <b>In Stock!</b>\n\n%s\n\nPrice: ₹%.0f\nQty: %d\n\n<a href='%s/en/product/%s'>View Product</a>",
-					html.EscapeString(p.Name), toFloat64(p.Price), p.InventoryQty, storeBaseURL, p.Alias)
+				nameLink := fmt.Sprintf("<a href='%s/en/product/%s'>%s</a>", storeBaseURL, p.Alias, html.EscapeString(p.Name))
+				untrackLink := fmt.Sprintf("<a href='https://t.me/%s?start=track_%s'>[Untrack]</a>", app.botUser, p.SKU)
+				text := fmt.Sprintf("✅ <b>In Stock!</b>\n\n%s\n\nPrice: ₹%.0f\nQty: %d\n\n%s",
+					nameLink, toFloat64(p.Price), p.InventoryQty, untrackLink)
 				app.b.SendMessage(ctx, &bot.SendMessageParams{
 					ChatID:    u.id,
 					Text:      text,
