@@ -4,13 +4,14 @@ set -e
 echo "=== ntfy-bot Linux deployment ==="
 
 INSTALL_DIR=/opt/ntfy-bot
+DATA_DIR=/var/ntfy-bot/data
 SERVICE_NAME=ntfy-bot
 
-# Create install directory
+# Create directories
 sudo mkdir -p "$INSTALL_DIR"
 
-# Copy binary
-sudo cp "$(dirname "$0")/../ntfy_bot" "$INSTALL_DIR/"
+# Build binary with prod tag
+CGO_ENABLED=1 go build -tags prod -ldflags="-s -w" -o "$INSTALL_DIR/ntfy_bot" .
 
 # Create .env if missing
 if [ ! -f "$INSTALL_DIR/.env" ]; then

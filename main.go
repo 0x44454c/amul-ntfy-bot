@@ -232,13 +232,25 @@ func loadEnvToken(key string) string {
 	return ""
 }
 
+func dbDir(path string) string {
+	i := strings.LastIndex(path, "/")
+	if i < 0 {
+		return ""
+	}
+	return path[:i]
+}
+
 func main() {
 	token := loadEnvToken("BOT_TOKEN")
 	if token == "" {
 		log.Fatal("BOT_TOKEN environment variable required")
 	}
 
-	db, err := gorm.Open(sqlite.Open("amul.db?_journal_mode=WAL&_busy_timeout=5000"), &gorm.Config{
+	if dir := dbDir(databasePath); dir != "" {
+		os.MkdirAll(dir, 0755)
+	}
+
+	db, err := gorm.Open(sqlite.Open(databasePath+"?_journal_mode=WAL&_busy_timeout=5000"), &gorm.Config{
 		Logger: logger.New(
 			log.New(os.Stdout, "\r\n", log.LstdFlags),
 			logger.Config{
