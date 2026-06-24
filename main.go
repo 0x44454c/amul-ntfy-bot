@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -30,6 +31,8 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+// build command: go build -ldflags="-s -w" -o ntfy_bot .
+
 const (
 	storeID      = "62fa94df8c13af2e242eba16"
 	storeBaseURL = "https://shop.amul.com"
@@ -38,19 +41,19 @@ const (
 	setPrefURL   = storeBaseURL + "/entity/ms.settings/_/setPreferences"
 )
 
+//go:embed substores.json
+var substoresJSON []byte
+
 var substoreIDs map[string]string
 
 func init() {
-	data, err := os.ReadFile("substores.json")
-	if err != nil {
-		log.Fatal("Failed to read substores.json:", err)
-	}
 	var entries []struct {
 		ID    string `json:"_id"`
 		Alias string `json:"alias"`
 	}
-	if err := json.Unmarshal(data, &entries); err != nil {
-		log.Fatal("Failed to parse substores.json:", err)
+	log.Printf("Loading substores.json... %d size", len(substoresJSON))
+	if err := json.Unmarshal(substoresJSON, &entries); err != nil {
+		log.Fatal("Failed to parse embedded substores.json:", err)
 	}
 	substoreIDs = make(map[string]string, len(entries))
 	for _, e := range entries {
@@ -588,7 +591,7 @@ func isAvailableToPurchase(p Product) bool {
 	allowed := p.InventoryAllowOutOfStock
 	allowStr, _ := allowed.(string)
 	allowBool, _ := allowed.(bool)
-	notAllowed := (allowed == nil || allowStr == "0" || (allowed != nil && !allowBool))
+	notAllowed := (allowed == nil || allowStr == "0" || !allowBool)
 	if !noLowStock && p.InventoryLowStockQty > p.InventoryQty && notAllowed {
 		return false
 	}
@@ -635,7 +638,7 @@ func formatProductBlock(p Product, index int, lastSeen *time.Time, remaining ...
 		fmt.Sprintf("     In Stock: <b>%s</b>", status),
 	}
 
-	if lastSeen != nil {
+	if lastSeen != nil && !isAvailableToPurchase(p) {
 		lines = append(lines, fmt.Sprintf("     Last InStock: <b>%s</b>", lastSeen.Format("02-01-2006, 03:04 PM")))
 	}
 
@@ -783,13 +786,13 @@ func (app *App) handleTracked(ctx context.Context, b *bot.Bot, update *models.Up
 			continue
 		}
 		tp := trackedMap[p.SKU]
-		remaining := -1
+		var remainingArgs []int
 		if user.TrackingStyle == "always" {
-			remaining = tp.RemainingCount
+			remainingArgs = []int{tp.RemainingCount}
 		}
 		isTrk := app.isTracked(userID, p.SKU)
 		isF := app.isFav(userID, p.SKU)
-		text := formatProductBlock(p, i, app.getLastInStockAt(p.SKU, user.Substore), remaining) + "\n" + productLinks(app.botUser, p.SKU, isTrk, isF)
+		text := formatProductBlock(p, i, app.getLastInStockAt(p.SKU, user.Substore), remainingArgs...) + "\n" + productLinks(app.botUser, p.SKU, isTrk, isF)
 		blocks = append(blocks, block{text: text, sku: p.SKU})
 	}
 
@@ -1571,7 +1574,7 @@ func (app *App) getLastInStockAt(sku, substore string) *time.Time {
 
 func (app *App) stockChecker(ctx context.Context) {
 	app.checkStock(ctx)
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(1*time.Minute + 30*time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1629,9 +1632,14 @@ func (app *App) checkStock(ctx context.Context) {
 		log.Printf("[tick] %s: fetched %d products, %d available", ss, len(products), available)
 
 		pmap := make(map[string]Product)
+		newlyAvailable := make(map[string]bool)
 		for _, p := range products {
 			pmap[p.SKU] = p
 			if isAvailableToPurchase(p) {
+				prev := app.getLastInStockAt(p.SKU, ss)
+				if prev == nil {
+					newlyAvailable[p.SKU] = true
+				}
 				app.db.Where("sku = ? AND substore = ?", p.SKU, ss).Delete(&StockHistory{})
 				app.db.Create(&StockHistory{
 					SKU:               p.SKU,
@@ -1657,16 +1665,22 @@ func (app *App) checkStock(ctx context.Context) {
 					continue
 				}
 
-				if u.trackingStyle != "always" && tp.RemainingCount <= 0 {
+				if u.trackingStyle == "always" && newlyAvailable[p.SKU] {
+					app.db.Model(&TrackedProduct{}).Where("id = ?", tp.ID).Update("remaining_count", tp.MaxCount)
+					tp.RemainingCount = tp.MaxCount
+				}
+
+				if tp.RemainingCount <= 0 {
+					if u.trackingStyle != "always" {
+						app.db.Delete(&TrackedProduct{}, tp.ID)
+					}
 					continue
 				}
 
-				if u.trackingStyle != "always" {
-					newCount := tp.RemainingCount - 1
-					app.db.Model(&TrackedProduct{}).Where("id = ?", tp.ID).Update("remaining_count", newCount)
-					if newCount == 0 {
-						app.db.Delete(&TrackedProduct{}, tp.ID)
-					}
+				newCount := tp.RemainingCount - 1
+				app.db.Model(&TrackedProduct{}).Where("id = ?", tp.ID).Update("remaining_count", newCount)
+				if u.trackingStyle != "always" && newCount == 0 {
+					app.db.Delete(&TrackedProduct{}, tp.ID)
 				}
 
 				text := fmt.Sprintf("✅ <b>In Stock!</b>\n\n%s\n\nPrice: ₹%.0f\nQty: %d\n\n<a href='%s/en/product/%s'>View Product</a>",
