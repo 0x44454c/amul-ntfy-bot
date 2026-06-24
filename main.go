@@ -61,6 +61,7 @@ func init() {
 var defaultHeaders = map[string]string{
 	"accept":             "application/json, text/plain, */*",
 	"accept-language":    "en-US,en;q=0.9",
+	"base_url":           storeBaseURL + "/en/browse/protein",
 	"cache-control":      "no-cache",
 	"frontend":           "1",
 	"pragma":             "no-cache",
@@ -160,16 +161,19 @@ type cookieRecord struct {
 }
 
 type Product struct {
-	SKU           string  `json:"sku"`
-	Name          string  `json:"name"`
-	Brand         string  `json:"brand"`
-	Price         float64 `json:"price"`
-	OriginalPrice float64 `json:"original_price"`
-	ComparePrice  float64 `json:"compare_price"`
-	Available     int     `json:"available"`
-	InventoryQty  int     `json:"inventory_quantity"`
-	Alias         string  `json:"alias"`
-	CatalogOnly   bool    `json:"catalog_only"`
+	SKU                      string      `json:"sku"`
+	Name                     string      `json:"name"`
+	Brand                    string      `json:"brand"`
+	Price                    interface{} `json:"price"`
+	OriginalPrice            interface{} `json:"original_price"`
+	ComparePrice             interface{} `json:"compare_price"`
+	Available                int         `json:"available"`
+	InventoryQty             int         `json:"inventory_quantity"`
+	InventoryLowStockQty     int         `json:"inventory_low_stock_quantity"`
+	InventoryAllowOutOfStock interface{} `json:"inventory_allow_out_of_stock"`
+	Alias                    string      `json:"alias"`
+	CatalogOnly              interface{} `json:"catalog_only"`
+	IsCatalog                interface{} `json:"is_catalog"`
 }
 
 type ProductsResponse struct {
@@ -231,7 +235,7 @@ func main() {
 		log.Fatal("BOT_TOKEN environment variable required")
 	}
 
-	db, err := gorm.Open(sqlite.Open("data/amul.db?_journal_mode=WAL&_busy_timeout=5000"), &gorm.Config{
+	db, err := gorm.Open(sqlite.Open("amul.db?_journal_mode=WAL&_busy_timeout=5000"), &gorm.Config{
 		Logger: logger.New(
 			log.New(os.Stdout, "\r\n", log.LstdFlags),
 			logger.Config{
@@ -499,7 +503,7 @@ func (app *App) handleSetPincode(ctx context.Context, b *bot.Bot, update *models
 
 	app.ensureUser(update.Message.From.ID)
 
-	substore, err := searchPincode(payload)
+	substore, err := app.searchPincode(payload)
 	if err != nil {
 		log.Printf("Pincode search error for %s: %v", payload, err)
 		app.send(ctx, update.Message.Chat.ID, "Could not find this pincode. Please try a different one.")
@@ -548,11 +552,74 @@ func productLinks(botUser, sku string, isTracked, isFav bool) string {
 		botUser, sku, trackLabel, botUser, sku, favLabel)
 }
 
+func toFloat64(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case string:
+		f, _ := strconv.ParseFloat(n, 64)
+		return f
+	}
+	return 0
+}
+
+func isAvailableToPurchase(p Product) bool {
+	allowOutOfStock := false
+	switch v := p.InventoryAllowOutOfStock.(type) {
+	case string:
+		allowOutOfStock = v != "" && v != "0"
+	case bool:
+		allowOutOfStock = v
+	case float64:
+		allowOutOfStock = v != 0
+	}
+	if allowOutOfStock {
+		return true
+	}
+	if p.Available <= 0 {
+		return false
+	}
+	noLowStock := p.InventoryLowStockQty <= 0
+	sufficientStock := p.InventoryQty >= p.InventoryLowStockQty
+	allowed := p.InventoryAllowOutOfStock
+	allowStr, _ := allowed.(string)
+	allowBool, _ := allowed.(bool)
+	notAllowed := (allowed == nil || allowStr == "0" || (allowed != nil && !allowBool))
+	if !noLowStock && p.InventoryLowStockQty > p.InventoryQty && notAllowed {
+		return false
+	}
+	return sufficientStock || noLowStock
+}
+
+func isCatalogOnly(p Product) bool {
+	switch v := p.CatalogOnly.(type) {
+	case bool:
+		return v
+	case string:
+		return v == "true" || v == "1"
+	case float64:
+		return v != 0
+	}
+	switch v := p.IsCatalog.(type) {
+	case bool:
+		return v
+	case string:
+		return v == "true" || v == "1"
+	case float64:
+		return v != 0
+	}
+	return false
+}
+
 func formatProductBlock(p Product, index int, lastSeen *time.Time, remaining ...int) string {
 	url := fmt.Sprintf("https://shop.amul.com/en/product/%s", p.Alias)
 
 	status := "No 🔴"
-	if p.Available != 0 {
+	if isAvailableToPurchase(p) {
 		status = "Yes 🟢"
 	}
 
@@ -564,7 +631,7 @@ func formatProductBlock(p Product, index int, lastSeen *time.Time, remaining ...
 	lines := []string{
 		fmt.Sprintf("%d. <b><a href=\"%s\">%s</a></b>", index+1, html.EscapeString(url), html.EscapeString(p.Name)),
 		`     Protein: <b>N/A</b>`,
-		fmt.Sprintf("     Price: <b>%.0f</b>", p.Price),
+		fmt.Sprintf("     Price: <b>%.0f</b>", toFloat64(p.Price)),
 		fmt.Sprintf("     In Stock: <b>%s</b>", status),
 	}
 
@@ -1194,8 +1261,17 @@ func (s *AmulSession) ensureInitialized() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.tid != "" {
+	u, _ := url.Parse(storeBaseURL)
+	existingCookies := s.jar.Cookies(u)
+	hasCookies := len(existingCookies) > 0
+
+	if s.tid != "" && hasCookies {
 		return nil
+	}
+
+	if s.tid != "" && !hasCookies {
+		log.Printf("Session has TID but no cookies, re-initializing")
+		s.tid = ""
 	}
 
 	client := &http.Client{Jar: s.jar}
@@ -1257,31 +1333,38 @@ func (s *AmulSession) ensureInitialized() error {
 		}
 		req3.Header.Set("content-type", "application/json")
 		req3.Header.Set("tid", makeTID(s.tid))
-		cookies3 := s.jar.Cookies(req3.URL)
-		var cp3 []string
-		for _, c := range cookies3 {
-			cp3 = append(cp3, c.Name+"="+c.Value)
-		}
-		if len(cp3) > 0 {
-			req3.Header.Set("cookie", strings.Join(cp3, "; "))
-		}
-		resp3, err := http.DefaultClient.Do(req3)
+		resp3, err := client.Do(req3)
 		if err == nil {
 			resp3.Body.Close()
+		} else {
+			log.Printf("setPreferences request failed for %s: %v", s.substore, err)
 		}
 	}
 
 	return nil
 }
 
-func searchPincode(pincode string) (string, error) {
+func (app *App) searchPincode(pincode string) (string, error) {
+	jar, _ := cookiejar.New(nil)
+	sess := &AmulSession{jar: jar}
+
+	if err := sess.ensureInitialized(); err != nil {
+		return "", fmt.Errorf("session init failed: %w", err)
+	}
+
+	sess.mu.Lock()
+	tid := sess.tid
+	sess.mu.Unlock()
+
 	urlStr := fmt.Sprintf(pincodeURL, pincode)
 	req, _ := http.NewRequest("GET", urlStr, nil)
 	for k, v := range defaultHeaders {
 		req.Header.Set(k, v)
 	}
+	req.Header.Set("tid", makeTID(tid))
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Jar: sess.jar}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("pincode search failed: %w", err)
 	}
@@ -1297,21 +1380,66 @@ func searchPincode(pincode string) (string, error) {
 	return result.Records[0].Substore, nil
 }
 
+var storeVersion int
+
+func ensureStoreVersion() int {
+	if storeVersion != 0 {
+		return storeVersion
+	}
+	req, _ := http.NewRequest("GET", "https://shop.amul.com/ms/store/amul/auto/EN/storeinfo.js", nil)
+	for k, v := range defaultHeaders {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("Failed to fetch store version: %v, defaulting to 5", err)
+		storeVersion = 5
+		return 5
+	}
+	defer resp.Body.Close()
+	var buf bytes.Buffer
+	buf.ReadFrom(resp.Body)
+	re := regexp.MustCompile(`req\.query\.v\s*=\s*['"]?([^'";\s]+)['"]?`)
+	m := re.FindStringSubmatch(buf.String())
+	if len(m) > 1 && m[1] != "" {
+		if v, err := strconv.Atoi(m[1]); err == nil {
+			storeVersion = v
+			return v
+		}
+	}
+	storeVersion = 5
+	log.Printf("Store version not found, defaulting to 5")
+	return 5
+}
+
 func buildProductsURL(substore string) string {
 	id := substoreIDs[substore]
-	u := storeBaseURL + "/api/1/entity/ms.products" +
+	return storeBaseURL + "/api/1/entity/ms.products" +
 		"?fields[name]=1" +
 		"&fields[brand]=1" +
+		"&fields[categories]=1" +
+		"&fields[collections]=1" +
+		"&fields[alias]=1" +
 		"&fields[sku]=1" +
 		"&fields[price]=1" +
-		"&fields[original_price]=1" +
 		"&fields[compare_price]=1" +
-		"&fields[available]=1" +
-		"&fields[inventory_quantity]=1" +
+		"&fields[original_price]=1" +
 		"&fields[images]=1" +
-		"&fields[alias]=1" +
+		"&fields[metafields]=1" +
+		"&fields[discounts]=1" +
 		"&fields[catalog_only]=1" +
 		"&fields[is_catalog]=1" +
+		"&fields[seller]=1" +
+		"&fields[available]=1" +
+		"&fields[inventory_quantity]=1" +
+		"&fields[net_quantity]=1" +
+		"&fields[num_reviews]=1" +
+		"&fields[avg_rating]=1" +
+		"&fields[inventory_low_stock_quantity]=1" +
+		"&fields[inventory_allow_out_of_stock]=1" +
+		"&fields[default_variant]=1" +
+		"&fields[variants]=1" +
+		"&fields[lp_seller_ids]=1" +
 		"&filters[0][field]=categories" +
 		"&filters[0][value][0]=protein" +
 		"&filters[0][operator]=in" +
@@ -1321,12 +1449,9 @@ func buildProductsURL(substore string) string {
 		"&limit=32" +
 		"&total=1" +
 		"&start=0" +
-		"&v=5" +
-		"&device_type=other"
-	if id != "" {
-		u += "&substore=" + id
-	}
-	return u
+		fmt.Sprintf("&v=%d", ensureStoreVersion()) +
+		"&device_type=other" +
+		"&substore=" + id
 }
 
 func (app *App) fetchProducts(substore string) ([]Product, error) {
@@ -1345,7 +1470,6 @@ func (app *App) fetchProducts(substore string) ([]Product, error) {
 			app.cacheMu.Lock()
 			app.cache[substore] = products
 			app.cacheMu.Unlock()
-			log.Printf("Loaded %d products from cache for %s", len(products), substore)
 			return products, nil
 		}
 	}
@@ -1357,7 +1481,6 @@ func (app *App) fetchProducts(substore string) ([]Product, error) {
 
 	session.mu.Lock()
 	tid := session.tid
-	mCookies := session.jar.Cookies(&url.URL{Scheme: "https", Host: "shop.amul.com"})
 	session.mu.Unlock()
 
 	req, _ := http.NewRequest("GET", buildProductsURL(substore), nil)
@@ -1367,15 +1490,8 @@ func (app *App) fetchProducts(substore string) ([]Product, error) {
 	req.Header.Set("referer", storeBaseURL+"/en/browse/protein")
 	req.Header.Set("tid", makeTID(tid))
 
-	var cp []string
-	for _, c := range mCookies {
-		cp = append(cp, c.Name+"="+c.Value)
-	}
-	if len(cp) > 0 {
-		req.Header.Set("cookie", strings.Join(cp, "; "))
-	}
-
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Jar: session.jar}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("products request failed: %w", err)
 	}
@@ -1386,13 +1502,28 @@ func (app *App) fetchProducts(substore string) ([]Product, error) {
 		return nil, fmt.Errorf("products parse failed: %w", err)
 	}
 
+	parsed := 0
+	filteredCatalog := 0
+	filteredSKU := 0
 	var products []Product
 	for _, raw := range rawResp.Data {
 		var p Product
 		if err := json.Unmarshal(raw, &p); err != nil {
+			if parsed == 0 {
+				log.Printf("First parse failure (showing first 200 bytes): %s", string(raw))
+				if len(raw) > 200 {
+					log.Printf("Truncated: %s", string(raw[:200]))
+				}
+			}
+			parsed++
 			continue
 		}
-		if p.SKU == "" || p.CatalogOnly {
+		if p.SKU == "" {
+			filteredSKU++
+			continue
+		}
+		if isCatalogOnly(p) {
+			filteredCatalog++
 			continue
 		}
 		p.Name = html.UnescapeString(p.Name)
@@ -1409,7 +1540,13 @@ func (app *App) fetchProducts(substore string) ([]Product, error) {
 		app.db.Create(&ProductCache{Substore: substore, Data: string(data), CachedAt: time.Now()})
 	}
 
-	log.Printf("Fetched %d products for substore %s", len(products), substore)
+	availCount := 0
+	for _, p := range products {
+		if isAvailableToPurchase(p) {
+			availCount++
+		}
+	}
+	log.Printf("Products for %s: %d total, %d available", substore, len(products), availCount)
 	return products, nil
 }
 
@@ -1485,7 +1622,7 @@ func (app *App) checkStock(ctx context.Context) {
 
 		available := 0
 		for _, p := range products {
-			if p.Available != 0 {
+			if isAvailableToPurchase(p) {
 				available++
 			}
 		}
@@ -1494,7 +1631,7 @@ func (app *App) checkStock(ctx context.Context) {
 		pmap := make(map[string]Product)
 		for _, p := range products {
 			pmap[p.SKU] = p
-			if p.Available != 0 {
+			if isAvailableToPurchase(p) {
 				app.db.Where("sku = ? AND substore = ?", p.SKU, ss).Delete(&StockHistory{})
 				app.db.Create(&StockHistory{
 					SKU:               p.SKU,
@@ -1516,7 +1653,7 @@ func (app *App) checkStock(ctx context.Context) {
 
 			for _, tp := range tracked {
 				p, ok := pmap[tp.SKU]
-				if !ok || p.Available == 0 {
+				if !ok || !isAvailableToPurchase(p) {
 					continue
 				}
 
@@ -1533,7 +1670,7 @@ func (app *App) checkStock(ctx context.Context) {
 				}
 
 				text := fmt.Sprintf("✅ <b>In Stock!</b>\n\n%s\n\nPrice: ₹%.0f\nQty: %d\n\n<a href='%s/en/product/%s'>View Product</a>",
-					html.EscapeString(p.Name), p.Price, p.InventoryQty, storeBaseURL, p.Alias)
+					html.EscapeString(p.Name), toFloat64(p.Price), p.InventoryQty, storeBaseURL, p.Alias)
 				app.b.SendMessage(ctx, &bot.SendMessageParams{
 					ChatID:    u.id,
 					Text:      text,

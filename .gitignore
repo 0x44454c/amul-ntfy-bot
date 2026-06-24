@@ -1,7 +1,7 @@
 .env*
 amul-notify/
 *.db
-*.shm
-*.wal
+*.db-shm
+*.db-wal
 ntfy_bot
 .DS_Store
