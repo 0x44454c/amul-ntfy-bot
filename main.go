@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -11,11 +12,13 @@ import (
 	"html"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -204,12 +207,17 @@ type pendingChange struct {
 	chatID   int64
 }
 
+type cachedProducts struct {
+	data     []Product
+	cachedAt time.Time
+}
+
 type App struct {
 	db       *gorm.DB
 	b        *bot.Bot
 	sessions map[string]*AmulSession
 	sessMu   sync.RWMutex
-	cache    map[string][]Product
+	cache    map[string]*cachedProducts
 	cacheMu  sync.RWMutex
 	botUser  string
 
@@ -248,7 +256,33 @@ func dbDir(path string) string {
 	return path[:i]
 }
 
+func socketPath() string {
+	dir := dbDir(databasePath)
+	if dir == "" {
+		dir = "."
+	}
+	return filepath.Join(dir, "bot.sock")
+}
+
 func main() {
+	if len(os.Args) >= 3 && os.Args[1] == "--announce" {
+		msg := strings.Join(os.Args[2:], " ")
+		if msg == "" {
+			log.Fatal("Empty message")
+		}
+		conn, err := net.Dial("unix", socketPath())
+		if err != nil {
+			log.Fatal("Bot is not running:", err)
+		}
+		defer conn.Close()
+		fmt.Fprintln(conn, msg)
+		resp, _ := bufio.NewReader(conn).ReadString('\n')
+		if resp != "" {
+			fmt.Print(resp)
+		}
+		os.Exit(0)
+	}
+
 	token := loadEnvToken("BOT_TOKEN")
 	if token == "" {
 		log.Fatal("BOT_TOKEN environment variable required")
@@ -293,7 +327,7 @@ func main() {
 		db:            db,
 		b:             b,
 		sessions:      make(map[string]*AmulSession),
-		cache:         make(map[string][]Product),
+		cache:         make(map[string]*cachedProducts),
 		awaitingInput:    make(map[int64]string),
 		pendingPincode:    make(map[int64]*pendingChange),
 	}
@@ -308,12 +342,17 @@ func main() {
 
 	app.registerHandlers()
 
+	sp := socketPath()
+	os.Remove(sp)
+	defer os.Remove(sp)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	log.Printf("Bot %s started", app.botUser)
 
 	go app.stockChecker(ctx)
+	go app.startIPCServer(ctx, sp)
 
 	b.Start(ctx)
 }
@@ -641,6 +680,66 @@ func (app *App) handlePincodeCancelCallback(ctx context.Context, b *bot.Bot, upd
 		Text:        "❌ Pincode change cancelled.",
 		ParseMode:   models.ParseModeHTML,
 	})
+}
+
+// ─── IPC / Announce ───
+
+func (app *App) startIPCServer(ctx context.Context, path string) {
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		log.Printf("IPC server failed to listen: %v", err)
+		return
+	}
+	log.Printf("IPC server listening on %s", path)
+
+	go func() {
+		<-ctx.Done()
+		l.Close()
+	}()
+
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				log.Printf("IPC accept error: %v", err)
+				time.Sleep(time.Second)
+			}
+			continue
+		}
+		go app.handleIPCConn(conn)
+	}
+}
+
+func (app *App) handleIPCConn(conn net.Conn) {
+	defer conn.Close()
+
+	msg, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		log.Printf("IPC read error: %v", err)
+		return
+	}
+
+	text := strings.TrimSpace(msg)
+	if text == "" {
+		return
+	}
+
+	log.Printf("IPC announcement: %s", text)
+
+	var rows []struct{ TelegramID int64 }
+	app.db.Model(&User{}).Select("telegram_id").Find(&rows)
+
+	for _, r := range rows {
+		app.b.SendMessage(context.Background(), &bot.SendMessageParams{
+			ChatID:    r.TelegramID,
+			Text:      fmt.Sprintf("📢 <b>Announcement</b>\n\n%s", text),
+			ParseMode: models.ParseModeHTML,
+		})
+	}
+	conn.Write([]byte("ok\n"))
 }
 
 func (app *App) handlePincode(ctx context.Context, b *bot.Bot, update *models.Update) {
@@ -1581,17 +1680,17 @@ func (app *App) fetchProducts(substore string) ([]Product, error) {
 	app.cacheMu.RLock()
 	cached, ok := app.cache[substore]
 	app.cacheMu.RUnlock()
-	if ok && len(cached) > 0 {
-		return cached, nil
+	if ok && cached != nil && len(cached.data) > 0 && time.Since(cached.cachedAt) < 1*time.Minute {
+		return cached.data, nil
 	}
 
 	var pc ProductCache
-	err := app.db.Where("substore = ? AND cached_at > ?", substore, time.Now().Add(-5*time.Minute)).First(&pc).Error
+	err := app.db.Where("substore = ? AND cached_at > ?", substore, time.Now().Add(-1*time.Minute)).First(&pc).Error
 	if err == nil {
 		var products []Product
 		if json.Unmarshal([]byte(pc.Data), &products) == nil && len(products) > 0 {
 			app.cacheMu.Lock()
-			app.cache[substore] = products
+			app.cache[substore] = &cachedProducts{data: products, cachedAt: time.Now()}
 			app.cacheMu.Unlock()
 			return products, nil
 		}
@@ -1655,7 +1754,7 @@ func (app *App) fetchProducts(substore string) ([]Product, error) {
 
 	if len(products) > 0 {
 		app.cacheMu.Lock()
-		app.cache[substore] = products
+		app.cache[substore] = &cachedProducts{data: products, cachedAt: time.Now()}
 		app.cacheMu.Unlock()
 
 		data, _ := json.Marshal(products)
