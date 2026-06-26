@@ -1848,7 +1848,6 @@ func (app *App) checkStock(ctx context.Context) {
 				available++
 			}
 		}
-		log.Printf("[tick] %s: fetched %d products, %d available", ss, len(products), available)
 
 		pmap := make(map[string]Product)
 		newlyAvailable := make(map[string]bool)
@@ -1867,6 +1866,30 @@ func (app *App) checkStock(ctx context.Context) {
 				})
 			}
 		}
+
+		var trackedSKUs []string
+		for _, u := range users {
+			if u.substore != ss {
+				continue
+			}
+			tu, _ := app.getTracked(u.id)
+			for _, tp := range tu {
+				trackedSKUs = append(trackedSKUs, tp.SKU)
+			}
+		}
+		trackedAvailable := 0
+		seen := map[string]bool{}
+		for _, sku := range trackedSKUs {
+			if seen[sku] {
+				continue
+			}
+			seen[sku] = true
+			if p, ok := pmap[sku]; ok && isAvailableToPurchase(p) {
+				trackedAvailable++
+			}
+		}
+		log.Printf("[tick] %s: fetched %d/%d products, tracked %d/%d",
+			ss, available, len(products), trackedAvailable, len(seen))
 
 		for _, u := range users {
 			if u.substore != ss {
@@ -1892,6 +1915,9 @@ func (app *App) checkStock(ctx context.Context) {
 				if tp.RemainingCount <= 0 {
 					if u.trackingStyle != "always" {
 						app.db.Delete(&TrackedProduct{}, tp.ID)
+						log.Printf("Removed tracked product %s for user %d (notifications exhausted)", p.SKU, u.id)
+					} else {
+						log.Printf("Skipping notification for %s (user %d, always style, remaining=%d)", p.SKU, u.id, tp.RemainingCount)
 					}
 					continue
 				}
@@ -1906,11 +1932,14 @@ func (app *App) checkStock(ctx context.Context) {
 				untrackLink := fmt.Sprintf("<a href='https://t.me/%s?start=track_%s'>[Untrack]</a>", app.botUser, p.SKU)
 				text := fmt.Sprintf("✅ <b>In Stock!</b>\n\n%s\n\nPrice: ₹%.0f\nQty: %d\n\n%s",
 					nameLink, toFloat64(p.Price), p.InventoryQty, untrackLink)
-				app.b.SendMessage(ctx, &bot.SendMessageParams{
+				log.Printf("Notifying user %d about %s (sku: %s, remaining before: %d)", u.id, p.Name, p.SKU, tp.RemainingCount)
+				if _, err := app.b.SendMessage(ctx, &bot.SendMessageParams{
 					ChatID:    u.id,
 					Text:      text,
 					ParseMode: models.ParseModeHTML,
-				})
+				}); err != nil {
+					log.Printf("Failed to send notification to user %d: %v", u.id, err)
+				}
 			}
 		}
 	}
